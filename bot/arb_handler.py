@@ -8,11 +8,12 @@ Architecture:
 - in_flight flag prevents concurrent orders during placement
 - Single FAK orders only (no bracket, no auto-scale, no retry on errors → no double-buy)
 
-Auto stop-loss (LEG1_OPEN):
+Auto stop-loss (LEG1_OPEN) — three-tier exit:
 - ARM      when leg1_max_seen >= entry + AUTO_HEDGE_ARM_PROFIT (0.10)
 - TRIGGER  when armed AND leg1_ask <= entry + FEE_BUFFER (0.05)
-- HEDGE    when triggered AND opp_ask <= 1.0 - entry - FEE_BUFFER (= BE)
-            otherwise we wait for next WS tick
+- TIER 1   opp_ask <= BE                          → hedge at BE (best)
+- TIER 2   opp_ask <= BE + MAX_HEDGE_LOSS (0.10)  → hedge at controlled loss
+- TIER 3   leg1_bid > 0                            → sell leg1 at bid (forced exit)
 
 Auto-exit (LEG2_OPEN):
 - bid_up + bid_down >= EXIT_THRESHOLD (1.03) → sell both at WS bids
@@ -58,6 +59,7 @@ FAK_SLIPPAGE = 0.01         # FAK price = ask + slippage
 # ── Auto stop-loss ──
 AUTO_HEDGE_ARM_PROFIT = 0.10
 FEE_BUFFER = 0.05
+MAX_HEDGE_LOSS_PER_SHARE = 0.10  # tier 2: hedge at up to BE + this if BE unreachable
 NEAR_EXPIRY_SEC = 60
 FORCE_SELL_SEC = 30
 
@@ -346,15 +348,37 @@ class HedgeMonitor:
                 return True
 
         # Auto stop-loss (LEG1_OPEN, armed, leg1 reverses to BE zone)
+        # Three-tier exit:
+        #   1) opp_ask ≤ BE                       → hedge at BE (best)
+        #   2) opp_ask ≤ BE + MAX_HEDGE_LOSS      → hedge with controlled loss
+        #   3) leg1_bid > 0                        → sell leg1 at bid (forced exit)
         if self.state == HedgeState.LEG1_OPEN and self.armed and 0 < leg1_ask <= self.trigger_price:
             opp_ask = self.ask[self.opp_token]
+            leg1_bid = self.bid[self.leg1_token]
+
+            tier: int = 0
             if 0 < opp_ask <= self.opp_be_price:
+                tier = 1
+            elif 0 < opp_ask <= self.opp_be_price + MAX_HEDGE_LOSS_PER_SHARE:
+                tier = 2
+            elif leg1_bid > 0.01:
+                tier = 3
+
+            if tier in (1, 2):
                 self.in_flight = True
                 try:
-                    await self._auto_hedge(opp_ask)
+                    await self._auto_hedge(opp_ask, tier=tier)
                 finally:
                     self.in_flight = False
-                # If hedge succeeded → state moved to LEG2_OPEN, keep monitoring for exit
+            elif tier == 3:
+                self.in_flight = True
+                try:
+                    await self._stop_loss_sell_leg1(leg1_bid)
+                finally:
+                    self.in_flight = False
+                self.state = HedgeState.CLOSED
+                return True
+            # else: no liquidity at all — wait for next tick or near-expiry sell
 
         # Auto-exit (LEG2_OPEN)
         if self.state == HedgeState.LEG2_OPEN:
@@ -371,11 +395,12 @@ class HedgeMonitor:
 
         return False
 
-    async def _auto_hedge(self, opp_ask: float):
+    async def _auto_hedge(self, opp_ask: float, tier: int = 1):
         from bot.storage import mark_hedge_filled
         target = round(opp_ask + FAK_SLIPPAGE, 3)
-        logger.info("MON #%d AUTO-HEDGE: opp_ask=%.3f BE=%.3f → FAK @ %.3f",
-                    self.hedge_id, opp_ask, self.opp_be_price, target)
+        label = "BE" if tier == 1 else "loss-budget"
+        logger.info("MON #%d AUTO-HEDGE [%s]: opp_ask=%.3f BE=%.3f → FAK @ %.3f",
+                    self.hedge_id, label, opp_ask, self.opp_be_price, target)
         result = await _safe_fak_buy(
             self.exec_client, token=self.opp_token, price=target, shares=self.leg1_shares,
             neg_risk=self.neg_risk, market_slug=self.market["slug"], market_id=self.market["market_id"],
@@ -395,15 +420,43 @@ class HedgeMonitor:
         self.state = HedgeState.LEG2_OPEN
 
         total = self.leg1_cost + cost
-        profit = min(self.leg1_shares, sh) * 1.0 - total
-        logger.info("MON #%d hedge filled: %s %.1fsh @ %.3f profit=$%.2f",
-                    self.hedge_id, self.opp_side, sh, ep, profit)
+        profit = round(min(self.leg1_shares, sh) * 1.0 - total, 2)
+        logger.info("MON #%d hedge filled [%s]: %s %.1fsh @ %.3f pnl=$%+.2f",
+                    self.hedge_id, label, self.opp_side, sh, ep, profit)
+        emoji = "🛡" if tier == 1 else "⚠️"
+        msg_label = "stop-loss BE" if tier == 1 else f"stop-loss (loss budget, opp>{self.opp_be_price:.2f})"
         if self.tg_send_fn:
             await self.tg_send_fn(self.chat_id,
-                f"🛡 <b>Auto-hedge #{self.hedge_id}</b> (stop-loss BE)\n"
+                f"{emoji} <b>Auto-hedge #{self.hedge_id}</b> ({msg_label})\n"
                 f"{self.opp_side} {sh:.1f}sh @ {ep:.3f} = ${cost:.2f}\n"
-                f"Total: ${total:.2f} | <b>Profit: ${profit:+.2f}</b>"
+                f"Total: ${total:.2f} | <b>PnL: ${profit:+.2f}</b>"
             )
+
+    async def _stop_loss_sell_leg1(self, leg1_bid: float):
+        """Tier 3: opp_ask too high to hedge — dump leg1 at bid."""
+        from bot.storage import mark_hedge_sold
+        target_bid = leg1_bid
+        logger.info("MON #%d STOP-LOSS SELL leg1: bid=%.3f (opp_ask=%.3f > BE+budget=%.3f)",
+                    self.hedge_id, leg1_bid, self.ask[self.opp_token],
+                    round(self.opp_be_price + MAX_HEDGE_LOSS_PER_SHARE, 3))
+        result = await _safe_fak_sell(self.exec_client, token=self.leg1_token,
+                                       price=target_bid, shares=self.leg1_shares)
+        if not result:
+            return
+        try:
+            avg = float(result.get("average_price") or result.get("price") or target_bid)
+            sz = float(result.get("size") or result.get("_order_size") or self.leg1_shares)
+            received = round(avg * sz, 2)
+        except Exception:
+            received = round(target_bid * self.leg1_shares, 2)
+        pnl = round(received - self.leg1_cost, 2)
+        if self.tg_send_fn:
+            await self.tg_send_fn(self.chat_id,
+                f"🚪 <b>Stop-loss sell #{self.hedge_id}</b> (opp недосяжний)\n"
+                f"{self.leg1_side} sold @ {avg:.3f} | Got ${received:.2f}\n"
+                f"<b>PnL: ${pnl:+.2f}</b>"
+            )
+        mark_hedge_sold(self.hedge_id)
 
     async def _auto_exit(self, b_up: float, b_down: float):
         from bot.storage import mark_hedge_sold
@@ -577,7 +630,9 @@ async def do_arb_buy(asset, window, stake_usd, exec_client, wallet_key, chat_id,
         f"{asset} {window} | {side} {shares:.1f}sh @ {ep:.3f} = ${cost:.2f}\n"
         f"Opp ask: {opp_ask:.3f}\n"
         f"Stop-loss: ARM @ leg1 ≥ {round(ep + AUTO_HEDGE_ARM_PROFIT, 3):.3f} → "
-        f"hedge if opp ≤ {round(1.0 - ep - FEE_BUFFER, 3):.3f}\n"
+        f"hedge BE ≤ {round(1.0 - ep - FEE_BUFFER, 3):.3f} | "
+        f"loss ≤ {round(1.0 - ep - FEE_BUFFER + MAX_HEDGE_LOSS_PER_SHARE, 3):.3f} | "
+        f"else dump leg1\n"
         f"TL: {market['time_left_sec']}s\n"
         f"\n/hedge — захедж зараз | /sell — продати"
     )
