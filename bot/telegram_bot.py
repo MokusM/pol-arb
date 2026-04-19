@@ -60,6 +60,23 @@ async def _tg_send(chat_id, text: str) -> None:
 
 # ── Commands ──
 
+@dp.message(Command("list"))
+async def cmd_list(message: types.Message):
+    await message.answer(
+        "<b>📋 Команди</b>\n"
+        "\n"
+        "/arb — купити дешеву сторону SOL 5m ($1, leg1)\n"
+        "/hedge — купити протилежну сторону (leg2)\n"
+        "\n"
+        "/balance — баланс USDC\n"
+        "/status — стан бота\n"
+        "/start — відновити торгівлю\n"
+        "/stop — пауза\n"
+        "/list — ця довідка",
+        parse_mode="HTML",
+    )
+
+
 @dp.message(Command("balance"))
 async def cmd_balance(message: types.Message):
     ec = _arb_client()
