@@ -117,7 +117,11 @@ async def get_clob_bids(token_up: str, token_down: str) -> tuple[float, float]:
 
 EXIT_THRESHOLD = 1.03  # sell both when bid_up + bid_down >= this
 WS_CLOB_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-TRAILING_HEDGE_REVERSAL = 0.05  # buy when ask reverses +5c from lowest seen
+
+# Auto-hedge stop-loss: arm when leg1 was at +PROFIT, trigger when it falls back to entry+FEE
+AUTO_HEDGE_ARM_PROFIT = 0.10   # leg1_max_seen must reach entry + 0.10 to ARM
+FEE_BUFFER = 0.05              # opp BE = 1.0 - leg1_entry - FEE_BUFFER
+HEDGE_RETRY_COOLDOWN = 3.0     # seconds between hedge attempts when trigger active
 
 _active_monitors: dict[int, asyncio.Task] = {}
 _trailing_monitors: dict[int, asyncio.Task] = {}
@@ -138,26 +142,27 @@ async def _trailing_hedge_monitor(
     chat_id: str,
     tg_send_fn,
 ):
-    """WS monitor: buy opposite at BE price, but only after ask was below BE first."""
+    """WS monitor on leg1: arm at entry+PROFIT, trigger on pullback to entry+FEE, hedge if opp<=BE."""
     import websockets
 
-    # BE price = 1.0 - leg1_price - fee buffer
-    FEE_BUFFER = 0.05
-    be_price = round(1.0 - leg1_price - FEE_BUFFER, 2)
-    trigger_price = min(max_price, be_price)
-    has_been_below = False  # only arm after 1.5s below BE
-    armed_since = None
-    triggered = False
+    arm_threshold = round(leg1_price + AUTO_HEDGE_ARM_PROFIT, 2)
+    trigger_price = round(leg1_price + FEE_BUFFER, 2)
+    opp_be_price = round(1.0 - leg1_price - FEE_BUFFER, 2)
 
-    # Auto-sell leg1 before expiry if unhedged
-    AUTO_SELL_BEFORE_EXPIRY = 60  # seconds
+    leg1_max_seen = 0.0
+    armed = False
+    last_attempt_ts = 0.0
+
+    AUTO_SELL_BEFORE_EXPIRY = 60
     expiry_time = datetime.now(timezone.utc) + timedelta(seconds=time_left_sec)
 
-    logger.info("TRAILING HEDGE #%d: BE trigger=%.3f (1.0 - %.3f - %.2f) | ask=%.3f | below=%s | expiry in %ds",
-                hedge_id, trigger_price, leg1_price, FEE_BUFFER, initial_ask, has_been_below, time_left_sec)
+    logger.info(
+        "TRAILING HEDGE #%d: leg1_entry=%.3f arm>=%.3f trigger<=%.3f opp_BE<=%.3f | expiry %ds",
+        hedge_id, leg1_price, arm_threshold, trigger_price, opp_be_price, time_left_sec,
+    )
 
-    async def _do_buy(price):
-        """Execute hedge buy and handle result."""
+    async def _do_buy(price: float) -> bool:
+        """Execute FAK hedge buy at given opp price."""
         result = await _buy_with_retry(
             exec_client,
             token_id=opp_token, price=price, size=shares,
@@ -191,12 +196,11 @@ async def _trailing_hedge_monitor(
         logger.info("TRAILING HEDGE #%d FILLED: %s @ %.3f profit=$%.2f", hedge_id, opp_side, ep, profit)
         if tg_send_fn:
             await tg_send_fn(chat_id,
-                f"🛡 <b>Auto-hedge #{hedge_id}</b> (BE trigger)\n"
+                f"🛡 <b>Auto-hedge #{hedge_id}</b> (stop-loss BE)\n"
                 f"{opp_side} {filled_shares:.1f}sh @ {ep:.3f} = ${cost:.2f}\n"
                 f"Total: ${total:.2f} | <b>Profit: ${profit:+.2f}</b>"
             )
 
-        # Start exit monitor
         if leg1_side == "UP":
             sh_up, sh_down = pending["leg1_shares"], filled_shares
         else:
@@ -208,16 +212,30 @@ async def _trailing_hedge_monitor(
                 sh_up, sh_down, total, exec_client, chat_id, tg_send_fn)
         return True
 
+    async def _try_hedge() -> bool:
+        """Check opp_ask via REST and hedge if at BE or better. Returns True if hedged."""
+        opp_ask, _ = await _fetch_book(opp_token)
+        if opp_ask <= 0:
+            return False
+        if opp_ask > opp_be_price:
+            logger.debug("TRAILING #%d skip: opp_ask=%.3f > BE=%.3f", hedge_id, opp_ask, opp_be_price)
+            return False
+        logger.info("TRAILING #%d trigger: opp_ask=%.3f <= BE=%.3f → hedge", hedge_id, opp_ask, opp_be_price)
+        return await _do_buy(opp_ask)
+
     try:
-        sub_msg = json.dumps({"type": "market", "assets_ids": [opp_token]})
+        sub_msg = json.dumps({"type": "market", "assets_ids": [leg1_token]})
 
         async with websockets.connect(WS_CLOB_URL, ping_interval=10, ping_timeout=5) as ws:
             await ws.send(sub_msg)
 
-            # Seed with REST ask
-            ask, _ = await _fetch_book(opp_token)
-            if ask > 0 and ask < trigger_price:
-                has_been_below = True
+            # Seed with REST leg1 ask
+            seed_ask, _ = await _fetch_book(leg1_token)
+            if seed_ask > 0:
+                leg1_max_seen = seed_ask
+                if seed_ask >= arm_threshold:
+                    armed = True
+                    logger.info("TRAILING #%d ARMED on seed: leg1=%.3f", hedge_id, seed_ask)
 
             async for raw in ws:
                 try:
@@ -225,27 +243,34 @@ async def _trailing_hedge_monitor(
                     if not isinstance(msgs, list):
                         msgs = [msgs]
 
+                    leg1_ask: float | None = None
                     for m in msgs:
-                        current_ask = None
-
-                        # Book update
-                        if m.get("asset_id") == opp_token and "asks" in m:
+                        if m.get("asset_id") == leg1_token and "asks" in m:
                             asks_list = [float(a.get("price", 0)) for a in (m.get("asks") or []) if float(a.get("price", 0)) > 0]
                             if asks_list:
-                                current_ask = min(asks_list)
+                                leg1_ask = min(asks_list)
 
-                        # Price changes
                         for ch in m.get("price_changes") or []:
-                            if ch.get("asset_id") == opp_token and (ch.get("side") or "").upper() == "SELL":
+                            if ch.get("asset_id") == leg1_token and (ch.get("side") or "").upper() == "SELL":
                                 ba = ch.get("best_ask")
                                 if ba:
-                                    current_ask = float(ba)
+                                    leg1_ask = float(ba)
 
-                        if current_ask is None:
-                            continue
+                    if leg1_ask is not None and leg1_ask > 0:
+                        if leg1_ask > leg1_max_seen:
+                            leg1_max_seen = leg1_ask
 
-                        # No auto-hedge by reversal — user hedges manually
-                        # Only auto-sell leg1 before expiry (handled below)
+                        if not armed and leg1_max_seen >= arm_threshold:
+                            armed = True
+                            logger.info("TRAILING #%d ARMED: leg1_max=%.3f >= %.3f",
+                                        hedge_id, leg1_max_seen, arm_threshold)
+
+                        if armed and leg1_ask <= trigger_price:
+                            now_ts = datetime.now(timezone.utc).timestamp()
+                            if now_ts - last_attempt_ts >= HEDGE_RETRY_COOLDOWN:
+                                last_attempt_ts = now_ts
+                                if await _try_hedge():
+                                    return  # hedged successfully → exit monitor
 
                 except Exception:
                     continue
