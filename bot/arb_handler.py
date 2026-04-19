@@ -8,9 +8,10 @@ Architecture:
 - in_flight flag prevents concurrent orders during placement
 - Single FAK orders only (no bracket, no auto-scale, no retry on errors → no double-buy)
 
-Auto stop-loss (LEG1_OPEN) — three-tier exit:
+Auto stop-loss (LEG1_OPEN) — debounced trigger + three-tier exit:
 - ARM      when leg1_max_seen >= entry + AUTO_HEDGE_ARM_PROFIT (0.10)
-- TRIGGER  when armed AND leg1_ask <= entry + FEE_BUFFER (0.05)
+- TRIGGER  when armed AND leg1_bid <= entry (= would lose money if sold)
+            AND condition held for >= TRIGGER_DEBOUNCE_SEC (3.0s) — filters wicks
 - TIER 1   opp_ask <= BE                          → hedge at BE (best)
 - TIER 2   opp_ask <= BE + MAX_HEDGE_LOSS (0.10)  → hedge at controlled loss
 - TIER 3   leg1_bid > 0                            → sell leg1 at bid (forced exit)
@@ -57,9 +58,10 @@ ARB_MIN_TIME_LEFT = 120     # seconds
 FAK_SLIPPAGE = 0.01         # FAK price = ask + slippage
 
 # ── Auto stop-loss ──
-AUTO_HEDGE_ARM_PROFIT = 0.10
-FEE_BUFFER = 0.05
-MAX_HEDGE_LOSS_PER_SHARE = 0.10  # tier 2: hedge at up to BE + this if BE unreachable
+AUTO_HEDGE_ARM_PROFIT = 0.10        # ARM when leg1_max_seen ≥ entry + this
+TRIGGER_DEBOUNCE_SEC = 3.0          # leg1_bid must stay ≤ entry for this long before firing
+FEE_BUFFER = 0.05                   # opp BE = 1.0 - leg1_entry - this
+MAX_HEDGE_LOSS_PER_SHARE = 0.10     # tier 2: hedge at up to BE + this if BE unreachable
 NEAR_EXPIRY_SEC = 60
 FORCE_SELL_SEC = 30
 
@@ -226,8 +228,9 @@ class HedgeMonitor:
         self.leg1_max_seen = 0.0
         self.armed = False
         self.arm_threshold = round(leg1_price + AUTO_HEDGE_ARM_PROFIT, 3)
-        self.trigger_price = round(leg1_price + FEE_BUFFER, 3)
         self.opp_be_price = round(1.0 - leg1_price - FEE_BUFFER, 3)
+        # Trigger fires when leg1_bid ≤ entry (= we'd lose money if sold) AND held for TRIGGER_DEBOUNCE_SEC
+        self._trigger_first_met_ts: Optional[float] = None
 
         self.leg2_shares = 0.0
         self.leg2_price = 0.0
@@ -240,9 +243,9 @@ class HedgeMonitor:
 
         secs_left = int((self.expiry - datetime.now(timezone.utc)).total_seconds())
         logger.info(
-            "MON #%d start: %s entry=%.3f arm>=%.3f trig<=%.3f opp_BE<=%.3f state=%s expiry %ds",
+            "MON #%d start: %s entry=%.3f arm>=%.3f trig=bid≤%.3f(+%.0fs) opp_BE<=%.3f state=%s expiry %ds",
             self.hedge_id, self.leg1_side, self.leg1_price,
-            self.arm_threshold, self.trigger_price, self.opp_be_price,
+            self.arm_threshold, self.leg1_price, TRIGGER_DEBOUNCE_SEC, self.opp_be_price,
             self.state.value, secs_left,
         )
 
@@ -347,38 +350,55 @@ class HedgeMonitor:
                 self.state = HedgeState.CLOSED
                 return True
 
-        # Auto stop-loss (LEG1_OPEN, armed, leg1 reverses to BE zone)
-        # Three-tier exit:
-        #   1) opp_ask ≤ BE                       → hedge at BE (best)
-        #   2) opp_ask ≤ BE + MAX_HEDGE_LOSS      → hedge with controlled loss
-        #   3) leg1_bid > 0                        → sell leg1 at bid (forced exit)
-        if self.state == HedgeState.LEG1_OPEN and self.armed and 0 < leg1_ask <= self.trigger_price:
-            opp_ask = self.ask[self.opp_token]
+        # Auto stop-loss (LEG1_OPEN):
+        #   TRIGGER condition: armed AND leg1_bid ≤ entry (= we'd lose money if sold)
+        #                       AND condition has been true for ≥ TRIGGER_DEBOUNCE_SEC (filters wicks)
+        #   Three-tier exit:
+        #     1) opp_ask ≤ BE                       → hedge at BE (best)
+        #     2) opp_ask ≤ BE + MAX_HEDGE_LOSS      → hedge with controlled loss
+        #     3) leg1_bid > 0                        → sell leg1 at bid (forced exit)
+        if self.state == HedgeState.LEG1_OPEN and self.armed:
             leg1_bid = self.bid[self.leg1_token]
+            in_loss_zone = leg1_bid > 0 and leg1_bid <= self.leg1_price
 
-            tier: int = 0
-            if 0 < opp_ask <= self.opp_be_price:
-                tier = 1
-            elif 0 < opp_ask <= self.opp_be_price + MAX_HEDGE_LOSS_PER_SHARE:
-                tier = 2
-            elif leg1_bid > 0.01:
-                tier = 3
+            now_ts = datetime.now(timezone.utc).timestamp()
+            if in_loss_zone:
+                if self._trigger_first_met_ts is None:
+                    self._trigger_first_met_ts = now_ts
+                    logger.info("MON #%d trigger condition first met: leg1_bid=%.3f ≤ entry=%.3f — debouncing %.0fs",
+                                self.hedge_id, leg1_bid, self.leg1_price, TRIGGER_DEBOUNCE_SEC)
+                elif now_ts - self._trigger_first_met_ts >= TRIGGER_DEBOUNCE_SEC:
+                    opp_ask = self.ask[self.opp_token]
 
-            if tier in (1, 2):
-                self.in_flight = True
-                try:
-                    await self._auto_hedge(opp_ask, tier=tier)
-                finally:
-                    self.in_flight = False
-            elif tier == 3:
-                self.in_flight = True
-                try:
-                    await self._stop_loss_sell_leg1(leg1_bid)
-                finally:
-                    self.in_flight = False
-                self.state = HedgeState.CLOSED
-                return True
-            # else: no liquidity at all — wait for next tick or near-expiry sell
+                    tier: int = 0
+                    if 0 < opp_ask <= self.opp_be_price:
+                        tier = 1
+                    elif 0 < opp_ask <= self.opp_be_price + MAX_HEDGE_LOSS_PER_SHARE:
+                        tier = 2
+                    elif leg1_bid > 0.01:
+                        tier = 3
+
+                    if tier in (1, 2):
+                        self.in_flight = True
+                        try:
+                            await self._auto_hedge(opp_ask, tier=tier)
+                        finally:
+                            self.in_flight = False
+                    elif tier == 3:
+                        self.in_flight = True
+                        try:
+                            await self._stop_loss_sell_leg1(leg1_bid)
+                        finally:
+                            self.in_flight = False
+                        self.state = HedgeState.CLOSED
+                        return True
+                    # else: no liquidity — wait
+            else:
+                # leg1_bid > entry → recovered, reset debounce
+                if self._trigger_first_met_ts is not None:
+                    logger.info("MON #%d trigger cleared: leg1_bid=%.3f > entry=%.3f — debounce reset",
+                                self.hedge_id, leg1_bid, self.leg1_price)
+                    self._trigger_first_met_ts = None
 
         # Auto-exit (LEG2_OPEN)
         if self.state == HedgeState.LEG2_OPEN:
@@ -630,7 +650,8 @@ async def do_arb_buy(asset, window, stake_usd, exec_client, wallet_key, chat_id,
         f"{asset} {window} | {side} {shares:.1f}sh @ {ep:.3f} = ${cost:.2f}\n"
         f"Opp ask: {opp_ask:.3f}\n"
         f"Stop-loss: ARM @ leg1 ≥ {round(ep + AUTO_HEDGE_ARM_PROFIT, 3):.3f} → "
-        f"hedge BE ≤ {round(1.0 - ep - FEE_BUFFER, 3):.3f} | "
+        f"trig leg1_bid ≤ {ep:.3f} ({TRIGGER_DEBOUNCE_SEC:.0f}s debounce)\n"
+        f"  hedge BE ≤ {round(1.0 - ep - FEE_BUFFER, 3):.3f} | "
         f"loss ≤ {round(1.0 - ep - FEE_BUFFER + MAX_HEDGE_LOSS_PER_SHARE, 3):.3f} | "
         f"else dump leg1\n"
         f"TL: {market['time_left_sec']}s\n"
