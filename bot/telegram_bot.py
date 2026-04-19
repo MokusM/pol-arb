@@ -24,8 +24,6 @@ from bot.config import (
     TELEGRAM_ENABLED,
     TELEGRAM_TOKEN,
 )
-from bot.state import state
-
 logger = logging.getLogger(__name__)
 
 bot = Bot(token=TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
@@ -67,11 +65,10 @@ async def cmd_list(message: types.Message):
         "\n"
         "/arb — купити дешеву сторону SOL 5m ($1, leg1)\n"
         "/hedge — купити протилежну сторону (leg2)\n"
+        "/sell — продати все відкрите (leg1 або leg1+leg2)\n"
         "\n"
         "/balance — баланс USDC\n"
         "/status — стан бота\n"
-        "/start — відновити торгівлю\n"
-        "/stop — пауза\n"
         "/list — ця довідка",
         parse_mode="HTML",
     )
@@ -90,37 +87,16 @@ async def cmd_balance(message: types.Message):
         await message.answer(f"❌ {html.escape(str(e))}")
 
 
-@dp.message(Command("stop"))
-async def cmd_stop(message: types.Message):
-    state.pause()
-    await message.answer(
-        "⏸ <b>Торгівлю зупинено.</b>\n/start — відновити.",
-        parse_mode="HTML",
-    )
-
-
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    if not state.is_paused:
-        await message.answer("✅ Торгівля вже активна.")
-        return
-    state.resume()
-    await message.answer("▶ <b>Торгівлю відновлено.</b>", parse_mode="HTML")
-
-
 @dp.message(Command("status"))
 async def cmd_status(message: types.Message):
     ec = _arb_client()
     client_ready = bool(ec and ec.ready)
-    is_live = state.is_live_allowed and client_ready
 
-    live_icon = "🟢" if is_live else "🔴"
     client_icon = "🟢" if client_ready else "🔴"
 
     lines = [
         "🤖 <b>Arb/Hedge Bot</b>",
         "",
-        f"{live_icon} Live: <b>{'ON' if is_live else 'OFF'}</b>  ·  "
         f"{client_icon} Client: <b>{'READY' if client_ready else 'NOT READY'}</b>",
         f"🔑 Arb wallet key: <code>{html.escape(ARB_WALLET_KEY)}</code>",
     ]
@@ -162,6 +138,24 @@ async def cmd_arb(message: types.Message):
 @dp.message(Command("hedge"))
 async def cmd_hedge(message: types.Message):
     await _do_hedge(message.chat.id)
+
+
+@dp.message(Command("sell"))
+async def cmd_sell(message: types.Message):
+    """Sell all open legs of latest active hedge at current bid."""
+    ec = _arb_client()
+    if not ec or not ec.ready:
+        await message.answer("❌ ExecutionClient не готовий")
+        return
+
+    from bot.arb_handler import do_arb_sell
+
+    try:
+        result = await do_arb_sell(ec, ARB_WALLET_KEY, str(message.chat.id), tg_send_fn=_tg_send)
+    except Exception as e:
+        logger.error("sell: %s", e, exc_info=True)
+        result = f"❌ Exception: {html.escape(str(e))}"
+    await message.answer(result, parse_mode="HTML")
 
 
 @dp.callback_query(lambda c: c.data == "hedge|now")

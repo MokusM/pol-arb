@@ -125,6 +125,42 @@ def get_latest_pending_hedge(chat_id: str, wallet_key: str | None = None) -> dic
         conn.close()
 
 
+def get_latest_active_hedge(chat_id: str, wallet_key: str | None = None) -> dict | None:
+    """Latest hedge in 'open' (leg1 only) or 'hedged' (leg1+leg2) state."""
+    conn = get_connection()
+    try:
+        conn.row_factory = sqlite3.Row
+        where = "status IN ('open','hedged') AND chat_id=?"
+        params: list = [str(chat_id)]
+        if wallet_key:
+            where += " AND wallet_key=?"
+            params.append(wallet_key)
+        row = conn.execute(
+            f"SELECT * FROM pending_hedges WHERE {where} ORDER BY id DESC LIMIT 1",
+            params,
+        ).fetchone()
+        return dict(row) if row else None
+    except Exception as e:
+        logger.error("get_latest_active_hedge: %s", e)
+        return None
+    finally:
+        conn.close()
+
+
+def mark_hedge_sold(hedge_id: int) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE pending_hedges SET status='sold_early' WHERE id=?",
+            (hedge_id,),
+        )
+        conn.commit()
+    except Exception as e:
+        logger.error("mark_hedge_sold: %s", e)
+    finally:
+        conn.close()
+
+
 def mark_hedge_filled(
     hedge_id: int, leg2_side: str, leg2_shares: float,
     leg2_price: float, leg2_cost: float, leg2_order_id: str,

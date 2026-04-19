@@ -330,6 +330,14 @@ def cancel_trailing_hedge(hedge_id: int):
         logger.info("Trailing hedge #%d cancelled (manual hedge)", hedge_id)
 
 
+def cancel_exit_monitor(hedge_id: int):
+    """Cancel auto-exit WS monitor (when user manually sells)."""
+    task = _active_monitors.pop(hedge_id, None)
+    if task and not task.done():
+        task.cancel()
+        logger.info("Exit monitor #%d cancelled (manual sell)", hedge_id)
+
+
 async def _buy_with_retry(exec_client, max_retries: int = 4, delay: float = 1.0, **kwargs) -> dict | None:
     """Buy shares with aggressive retry on CLOB 500 errors."""
     for attempt in range(max_retries):
@@ -979,4 +987,95 @@ async def do_arb_hedge(
         f"Total cost: ${total:.2f}{scale_line}\n"
         f"Expected: ${min_payout - total:+.2f} (worst) / ${max_payout - total:+.2f} (best)\n"
         f"👁 Auto-exit monitor ON (threshold {EXIT_THRESHOLD:.2f})"
+    )
+
+
+async def do_arb_sell(
+    exec_client, wallet_key: str, chat_id: str,
+    tg_send_fn=None,
+) -> str:
+    """Sell all legs of latest active hedge at current bid. 1 leg → 1 sell, 2 legs → 2 sells."""
+    from bot.storage import get_latest_active_hedge, mark_hedge_sold
+
+    hedge = get_latest_active_hedge(chat_id, wallet_key)
+    if not hedge:
+        return "❌ Немає активних позицій"
+
+    hedge_id = hedge["id"]
+    market_slug = hedge.get("market_slug") or ""
+
+    # Stop background monitors
+    cancel_trailing_hedge(hedge_id)
+    cancel_exit_monitor(hedge_id)
+
+    # Refetch market tokens via slug (market_id-based fetch requires live market)
+    async with httpx.AsyncClient(timeout=5) as c:
+        try:
+            r = await c.get(f"{GAMMA}/markets/slug/{market_slug}")
+            if r.status_code != 200:
+                return f"❌ Маркет {market_slug} недоступний"
+            m = r.json()
+            tokens = m.get("clobTokenIds") or []
+            if isinstance(tokens, str):
+                tokens = json.loads(tokens)
+            if len(tokens) < 2:
+                return "❌ Маркет без токенів"
+            token_up, token_down = str(tokens[0]), str(tokens[1])
+        except Exception as e:
+            return f"❌ Fetch market: {e}"
+
+    leg1_side = hedge.get("leg1_side") or ""
+    leg1_token = token_up if leg1_side == "UP" else token_down
+    leg1_shares = float(hedge.get("leg1_shares") or 0)
+    leg1_cost = float(hedge.get("leg1_cost") or 0)
+
+    leg2_side = hedge.get("leg2_side")
+    leg2_token = token_down if leg1_side == "UP" else token_up
+    leg2_shares = float(hedge.get("leg2_shares") or 0)
+    leg2_cost = float(hedge.get("leg2_cost") or 0)
+
+    bid_up, bid_down = await get_clob_bids(token_up, token_down)
+    leg1_bid = bid_up if leg1_side == "UP" else bid_down
+    leg2_bid = bid_down if leg1_side == "UP" else bid_up
+
+    async def _sell(token: str, bid: float, shares: float, label: str) -> tuple[float, str]:
+        if shares <= 0:
+            return 0.0, f"{label}: skip (0 shares)"
+        if bid <= 0:
+            return 0.0, f"{label}: skip (no bid)"
+        res = await exec_client.sell_shares(token, bid, shares)
+        if not isinstance(res, dict) or res.get("success") is False:
+            err = res.get("error", "?") if isinstance(res, dict) else "?"
+            return 0.0, f"❌ {label} FAIL: {err}"
+        try:
+            avg = float(res.get("average_price") or res.get("price") or bid)
+            sz = float(res.get("size") or res.get("_order_size") or shares)
+            got = round(avg * sz, 2)
+        except Exception:
+            avg, sz, got = bid, shares, round(bid * shares, 2)
+        return got, f"{label} {sz:.1f}sh @ {avg:.3f} = ${got:.2f}"
+
+    lines: list[str] = []
+    total_received = 0.0
+
+    got1, line1 = await _sell(leg1_token, leg1_bid, leg1_shares, leg1_side)
+    total_received += got1
+    lines.append(line1)
+
+    has_leg2 = bool(leg2_side) and leg2_shares > 0
+    if has_leg2:
+        got2, line2 = await _sell(leg2_token, leg2_bid, leg2_shares, leg2_side)
+        total_received += got2
+        lines.append(line2)
+
+    mark_hedge_sold(hedge_id)
+
+    total_cost = leg1_cost + (leg2_cost if has_leg2 else 0)
+    pnl = round(total_received - total_cost, 2)
+
+    return (
+        f"💸 <b>Sell #{hedge_id}</b>\n"
+        + "\n".join(lines)
+        + f"\nReceived: ${total_received:.2f} | Cost: ${total_cost:.2f}\n"
+          f"<b>PnL: ${pnl:+.2f}</b>"
     )
