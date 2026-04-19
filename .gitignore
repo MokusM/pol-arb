@@ -1,0 +1,27 @@
+# Secrets
+.env
+
+# Databases
+*.db
+*.db-journal
+
+# Logs
+*.log
+*.log.1
+*.log.2
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+
+# IDE / tools
+.vscode/
+.cursor/
+.claude/
+.pytest_cache/
+.coverage
