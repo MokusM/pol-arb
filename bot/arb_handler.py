@@ -693,9 +693,16 @@ async def do_arb_buy(asset, window, stake_usd, exec_client, wallet_key, chat_id,
     if market["time_left_sec"] < ARB_MIN_TIME_LEFT:
         return f"⚠️ Skip: {market['time_left_sec']}s left"
 
+    # TREND filter: skip if market is trending (hedge unreachable → full loss risk)
+    from bot.trend_filter import check_trend
+    is_trend, diag = await check_trend(asset)
+    logger.info("ARB %s trend-filter: trend=%s | %s", asset, is_trend, diag)
+    if is_trend:
+        return f"🔴 <b>TRENDING — /arb skipped</b>\n{diag}\n(арб незахеджимий у трендах — чекай range)"
+
     target = round(ask + FAK_SLIPPAGE, 3)
-    logger.info("ARB BUY: %s %s @ %.3f (ask=%.3f opp=%.3f shares=%.1f tl=%ds)",
-                asset, side, target, ask, opp_ask, ARB_SHARES, market["time_left_sec"])
+    logger.info("ARB BUY: %s %s @ %.3f (ask=%.3f opp=%.3f shares=%.1f tl=%ds | %s)",
+                asset, side, target, ask, opp_ask, ARB_SHARES, market["time_left_sec"], diag)
 
     result, reason = await _safe_fak_buy(
         exec_client, token=token, price=target, shares=ARB_SHARES,
