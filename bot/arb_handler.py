@@ -30,6 +30,7 @@ Public API:
 """
 
 import asyncio
+import html
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -493,7 +494,7 @@ class HedgeMonitor:
         logger.info("MON #%d hedge filled [%s]: %s %.1fsh @ %.3f pnl=$%+.2f",
                     self.hedge_id, label, self.opp_side, sh, ep, profit)
         emoji = "🛡" if tier == 1 else "⚠️"
-        msg_label = "stop-loss BE" if tier == 1 else f"stop-loss (loss budget, opp>{self.opp_be_price:.2f})"
+        msg_label = "stop-loss BE" if tier == 1 else f"stop-loss (loss budget, opp above {self.opp_be_price:.2f})"
         if self.tg_send_fn:
             await self.tg_send_fn(self.chat_id,
                 f"{emoji} <b>Auto-hedge #{self.hedge_id}</b> ({msg_label})\n"
@@ -514,7 +515,7 @@ class HedgeMonitor:
             logger.info("MON #%d STOP-LOSS sell failed: %s", self.hedge_id, reason)
             if self.tg_send_fn:
                 await self.tg_send_fn(self.chat_id,
-                    f"⚠️ <b>Stop-loss sell #{self.hedge_id} FAIL</b>: {reason}")
+                    f"⚠️ <b>Stop-loss sell #{self.hedge_id} FAIL</b>: {html.escape(reason or '?')}")
             return
         try:
             avg = float(result.get("average_price") or result.get("price") or target_bid)
@@ -548,7 +549,7 @@ class HedgeMonitor:
             logger.warning("MON #%d UP sell FAILED (%s) — skip DOWN, will retry", self.hedge_id, reason_up)
             if self.tg_send_fn:
                 await self.tg_send_fn(self.chat_id,
-                    f"⚠️ <b>Exit #{self.hedge_id} retry</b>\nUP sell failed: {reason_up} — DOWN not attempted, will retry")
+                    f"⚠️ <b>Exit #{self.hedge_id} retry</b>\nUP sell failed: {html.escape(reason_up or '?')} — DOWN not attempted, will retry")
             return False
 
         res_down, reason_down = await _safe_fak_sell(self.exec_client, token=token_down, price=b_down, shares=sh_down)
@@ -582,9 +583,9 @@ class HedgeMonitor:
         if self.tg_send_fn:
             fail_lines = []
             if not res_up:
-                fail_lines.append(f"⚠️ UP sell FAIL: {reason_up}")
+                fail_lines.append(f"⚠️ UP sell FAIL: {html.escape(reason_up or '?')}")
             if not res_down:
-                fail_lines.append(f"⚠️ DOWN sell FAIL: {reason_down}")
+                fail_lines.append(f"⚠️ DOWN sell FAIL: {html.escape(reason_down or '?')}")
             extra = ("\n" + "\n".join(fail_lines)) if fail_lines else ""
             await self.tg_send_fn(self.chat_id,
                 f"💰 <b>Early exit #{self.hedge_id}</b>{partial}\n"
@@ -611,7 +612,7 @@ class HedgeMonitor:
             logger.warning("MON #%d expiry sell failed: %s", self.hedge_id, reason)
             if self.tg_send_fn:
                 await self.tg_send_fn(self.chat_id,
-                    f"⚠️ <b>Auto-sell leg1 #{self.hedge_id} FAIL</b>: {reason} — settlement")
+                    f"⚠️ <b>Auto-sell leg1 #{self.hedge_id} FAIL</b>: {html.escape(reason or '?')} — settlement")
             return
         try:
             avg = float(result.get("average_price") or result.get("price") or leg1_bid)
@@ -689,7 +690,7 @@ async def do_arb_buy(asset, window, stake_usd, exec_client, wallet_key, chat_id,
         opp_token = market["token_up"]
 
     if ask < ARB_MIN_LEG1_PRICE:
-        return f"⚠️ Skip: leg1 {ask:.2f} < min {ARB_MIN_LEG1_PRICE:.2f}"
+        return f"⚠️ Skip: leg1 {ask:.2f} (min {ARB_MIN_LEG1_PRICE:.2f})"
     if market["time_left_sec"] < ARB_MIN_TIME_LEFT:
         return f"⚠️ Skip: {market['time_left_sec']}s left"
 
@@ -709,7 +710,7 @@ async def do_arb_buy(asset, window, stake_usd, exec_client, wallet_key, chat_id,
         neg_risk=market["neg_risk"], market_slug=market["slug"], market_id=market["market_id"],
     )
     if not result:
-        return f"❌ Buy failed: {reason}"
+        return f"❌ Buy failed: {html.escape(reason or '?')}"
 
     ep = float(result.get("_effective_price", target))
     shares = float(result.get("_order_size", ARB_SHARES))
@@ -786,7 +787,7 @@ async def do_arb_hedge(exec_client, wallet_key, chat_id, tg_send_fn=None) -> str
         neg_risk=neg_risk, market_slug=pending["market_slug"], market_id=pending["market_id"],
     )
     if not result:
-        return f"❌ Hedge failed: {reason}"
+        return f"❌ Hedge failed: {html.escape(reason or '?')}"
 
     ep = float(result.get("_effective_price", target))
     shares = float(result.get("_order_size", leg1_shares))
@@ -860,7 +861,7 @@ async def do_arb_sell(exec_client, wallet_key, chat_id, tg_send_fn=None) -> str:
             return 0.0, f"{label}: skip (no bid)"
         res, reason = await _safe_fak_sell(exec_client, token=token, price=bid, shares=shares)
         if not res:
-            return 0.0, f"❌ {label} sell FAIL: {reason}"
+            return 0.0, f"❌ {label} sell FAIL: {html.escape(reason or '?')}"
         try:
             avg = float(res.get("average_price") or res.get("price") or bid)
             sz = float(res.get("size") or res.get("_order_size") or shares)
