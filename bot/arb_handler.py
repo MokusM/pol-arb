@@ -55,7 +55,7 @@ WINDOWS_MIN = {"5m": 5, "15m": 15}
 ARB_SHARES = 5.5            # leg1 size (5 + fee buffer for round-trips)
 ARB_MIN_LEG1_PRICE = 0.35   # skip cheap-side if too cheap
 ARB_MIN_TIME_LEFT = 120     # seconds
-FAK_SLIPPAGE = 0.01         # FAK price = ask + slippage
+FAK_SLIPPAGE = 0.03         # FAK price = ask + slippage (room for ask to move between fetch and post)
 
 # ── Auto stop-loss ──
 AUTO_HEDGE_ARM_PROFIT = 0.10        # ARM when leg1_max_seen ≥ entry + this
@@ -167,8 +167,28 @@ async def _refetch_market_tokens(slug: str) -> Optional[tuple[str, str, bool, in
 
 # ── Order primitives (no retry on errors → no duplicates) ──
 
-async def _safe_fak_buy(exec_client, *, token, price, shares, neg_risk, market_slug, market_id) -> Optional[dict]:
-    """Single FAK buy. Returns dict on success, None on any error/exception."""
+def _classify_error(err: object) -> str:
+    """Map raw CLOB error to short user-friendly reason."""
+    s = str(err).lower()
+    if "no orders found to match" in s:
+        return "price moved (FAK no-match)"
+    if "market_resolved" in s or "market is resolved" in s:
+        return "market closed/resolved"
+    if "request exception" in s or "status_code=none" in s:
+        return "network error"
+    if "insufficient" in s and "balance" in s:
+        return "insufficient balance"
+    if "insufficient" in s and "allowance" in s:
+        return "insufficient allowance"
+    if "tick" in s:
+        return "invalid tick price"
+    if "min" in s and "size" in s:
+        return "below min order size"
+    return str(err)[:80]
+
+
+async def _safe_fak_buy(exec_client, *, token, price, shares, neg_risk, market_slug, market_id) -> tuple[Optional[dict], Optional[str]]:
+    """Single FAK buy. Returns (result, None) on success, (None, reason) on failure."""
     try:
         result = await exec_client.buy_shares(
             token_id=token, price=price, size=shares,
@@ -176,27 +196,31 @@ async def _safe_fak_buy(exec_client, *, token, price, shares, neg_risk, market_s
             order_type="FAK", use_exact_price=True,
         )
         if isinstance(result, dict) and result.get("success") is not False:
-            return result
+            return result, None
         err = result.get("error", "?") if isinstance(result, dict) else result
+        reason = _classify_error(err)
         logger.warning("FAK buy returned error: %s", err)
-        return None
+        return None, reason
     except Exception as e:
+        reason = _classify_error(e)
         logger.error("FAK buy exception: %s", e)
-        return None
+        return None, reason
 
 
-async def _safe_fak_sell(exec_client, *, token, price, shares) -> Optional[dict]:
-    """Single FAK sell. Returns dict on success, None on any error/exception."""
+async def _safe_fak_sell(exec_client, *, token, price, shares) -> tuple[Optional[dict], Optional[str]]:
+    """Single FAK sell. Returns (result, None) on success, (None, reason) on failure."""
     try:
         result = await exec_client.sell_shares(token, price, shares)
         if isinstance(result, dict) and result.get("success") is not False:
-            return result
+            return result, None
         err = result.get("error", "?") if isinstance(result, dict) else result
+        reason = _classify_error(err)
         logger.warning("FAK sell returned error: %s", err)
-        return None
+        return None, reason
     except Exception as e:
+        reason = _classify_error(e)
         logger.error("FAK sell exception: %s", e)
-        return None
+        return None, reason
 
 
 # ── Monitor (event-driven state machine) ──
@@ -421,11 +445,12 @@ class HedgeMonitor:
         label = "BE" if tier == 1 else "loss-budget"
         logger.info("MON #%d AUTO-HEDGE [%s]: opp_ask=%.3f BE=%.3f → FAK @ %.3f",
                     self.hedge_id, label, opp_ask, self.opp_be_price, target)
-        result = await _safe_fak_buy(
+        result, reason = await _safe_fak_buy(
             self.exec_client, token=self.opp_token, price=target, shares=self.leg1_shares,
             neg_risk=self.neg_risk, market_slug=self.market["slug"], market_id=self.market["market_id"],
         )
         if not result:
+            logger.info("MON #%d AUTO-HEDGE failed: %s — will retry on next tick", self.hedge_id, reason)
             return  # stay in LEG1_OPEN — next tick may retry
 
         ep = float(result.get("_effective_price", target))
@@ -459,15 +484,20 @@ class HedgeMonitor:
         logger.info("MON #%d STOP-LOSS SELL leg1: bid=%.3f (opp_ask=%.3f > BE+budget=%.3f)",
                     self.hedge_id, leg1_bid, self.ask[self.opp_token],
                     round(self.opp_be_price + MAX_HEDGE_LOSS_PER_SHARE, 3))
-        result = await _safe_fak_sell(self.exec_client, token=self.leg1_token,
-                                       price=target_bid, shares=self.leg1_shares)
+        result, reason = await _safe_fak_sell(self.exec_client, token=self.leg1_token,
+                                               price=target_bid, shares=self.leg1_shares)
         if not result:
+            logger.info("MON #%d STOP-LOSS sell failed: %s", self.hedge_id, reason)
+            if self.tg_send_fn:
+                await self.tg_send_fn(self.chat_id,
+                    f"⚠️ <b>Stop-loss sell #{self.hedge_id} FAIL</b>: {reason}")
             return
         try:
             avg = float(result.get("average_price") or result.get("price") or target_bid)
             sz = float(result.get("size") or result.get("_order_size") or self.leg1_shares)
             received = round(avg * sz, 2)
         except Exception:
+            avg = target_bid
             received = round(target_bid * self.leg1_shares, 2)
         pnl = round(received - self.leg1_cost, 2)
         if self.tg_send_fn:
@@ -488,15 +518,17 @@ class HedgeMonitor:
         bid_sum = b_up + b_down
         logger.info("MON #%d EXIT: bid_sum=%.3f", self.hedge_id, bid_sum)
 
-        res_up = await _safe_fak_sell(self.exec_client, token=token_up, price=b_up, shares=sh_up)
+        res_up, reason_up = await _safe_fak_sell(self.exec_client, token=token_up, price=b_up, shares=sh_up)
         if not res_up:
-            logger.warning("MON #%d UP sell FAILED — skip DOWN, settlement", self.hedge_id)
+            logger.warning("MON #%d UP sell FAILED (%s) — skip DOWN, settlement", self.hedge_id, reason_up)
             if self.tg_send_fn:
                 await self.tg_send_fn(self.chat_id,
-                    f"⚠️ <b>Exit #{self.hedge_id} partial fail</b>\nUP sell failed — DOWN NOT sold")
+                    f"⚠️ <b>Exit #{self.hedge_id} partial fail</b>\nUP sell failed: {reason_up} — DOWN NOT sold")
             return
 
-        res_down = await _safe_fak_sell(self.exec_client, token=token_down, price=b_down, shares=sh_down)
+        res_down, reason_down = await _safe_fak_sell(self.exec_client, token=token_down, price=b_down, shares=sh_down)
+        if not res_down:
+            logger.warning("MON #%d DOWN sell FAILED (%s) after UP sold", self.hedge_id, reason_down)
 
         actual = 0.0
         for res in (res_up, res_down):
@@ -527,9 +559,13 @@ class HedgeMonitor:
         from bot.storage import mark_hedge_sold
         logger.info("MON #%d auto-sell leg1: bid=%.3f, %ds to expiry",
                     self.hedge_id, leg1_bid, int(secs_left))
-        result = await _safe_fak_sell(self.exec_client, token=self.leg1_token,
-                                       price=leg1_bid, shares=self.leg1_shares)
+        result, reason = await _safe_fak_sell(self.exec_client, token=self.leg1_token,
+                                               price=leg1_bid, shares=self.leg1_shares)
         if not result:
+            logger.warning("MON #%d expiry sell failed: %s", self.hedge_id, reason)
+            if self.tg_send_fn:
+                await self.tg_send_fn(self.chat_id,
+                    f"⚠️ <b>Auto-sell leg1 #{self.hedge_id} FAIL</b>: {reason} — settlement")
             return
         try:
             avg = float(result.get("average_price") or result.get("price") or leg1_bid)
@@ -615,12 +651,12 @@ async def do_arb_buy(asset, window, stake_usd, exec_client, wallet_key, chat_id,
     logger.info("ARB BUY: %s %s @ %.3f (ask=%.3f opp=%.3f shares=%.1f tl=%ds)",
                 asset, side, target, ask, opp_ask, ARB_SHARES, market["time_left_sec"])
 
-    result = await _safe_fak_buy(
+    result, reason = await _safe_fak_buy(
         exec_client, token=token, price=target, shares=ARB_SHARES,
         neg_risk=market["neg_risk"], market_slug=market["slug"], market_id=market["market_id"],
     )
     if not result:
-        return "❌ Buy failed"
+        return f"❌ Buy failed: {reason}"
 
     ep = float(result.get("_effective_price", target))
     shares = float(result.get("_order_size", ARB_SHARES))
@@ -692,12 +728,12 @@ async def do_arb_hedge(exec_client, wallet_key, chat_id, tg_send_fn=None) -> str
     logger.info("MANUAL HEDGE #%d: opp=%s ask=%.3f → FAK @ %.3f shares=%.1f",
                 hedge_id, opp_side, opp_ask, target, leg1_shares)
 
-    result = await _safe_fak_buy(
+    result, reason = await _safe_fak_buy(
         exec_client, token=opp_token, price=target, shares=leg1_shares,
         neg_risk=neg_risk, market_slug=pending["market_slug"], market_id=pending["market_id"],
     )
     if not result:
-        return "❌ Hedge failed"
+        return f"❌ Hedge failed: {reason}"
 
     ep = float(result.get("_effective_price", target))
     shares = float(result.get("_order_size", leg1_shares))
@@ -769,9 +805,9 @@ async def do_arb_sell(exec_client, wallet_key, chat_id, tg_send_fn=None) -> str:
             return 0.0, f"{label}: skip (0 shares)"
         if bid <= 0:
             return 0.0, f"{label}: skip (no bid)"
-        res = await _safe_fak_sell(exec_client, token=token, price=bid, shares=shares)
+        res, reason = await _safe_fak_sell(exec_client, token=token, price=bid, shares=shares)
         if not res:
-            return 0.0, f"❌ {label} sell FAIL"
+            return 0.0, f"❌ {label} sell FAIL: {reason}"
         try:
             avg = float(res.get("average_price") or res.get("price") or bid)
             sz = float(res.get("size") or res.get("_order_size") or shares)
