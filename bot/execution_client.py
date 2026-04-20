@@ -503,9 +503,11 @@ class ExecutionClient:
         neg_risk: bool = False,
         tick_size: str = "0.01",
         fallback_size: float | None = None,
+        order_type: str = "FAK",
     ) -> Optional[dict]:
         """Продати shares (для partial exit / stop-loss).
 
+        order_type: "FAK" (default — fill-and-kill, taker) або "GTC" (maker, sits in book).
         fallback_size — якщо CLOB відхилив через мінімальний розмір,
         повторити з цією кількістю (зазвичай = всі remaining shares).
         """
@@ -515,6 +517,7 @@ class ExecutionClient:
 
         # CLOB не приймає ціну >= 1.0 — кепуємо до 0.99
         price = min(price, 0.99)
+        _ot = OrderType.FAK if order_type.upper() == "FAK" else OrderType.GTC
 
         async def _attempt(sell_size: float) -> Optional[dict]:
             try:
@@ -531,16 +534,32 @@ class ExecutionClient:
                 )
 
                 def _post():
-                    return self.client.create_and_post_order(order_args, options)
+                    order = self.client.create_order(order_args, options)
+                    return self.client.post_order(order, orderType=_ot)
 
                 signed = await loop.run_in_executor(None, _post)
                 logger.info(
-                    "ORDER PLACED: SELL %s shares @ %.2f | token=%s | result=%s",
-                    sell_size, price, token_id[:12], signed,
+                    "ORDER PLACED (%s): SELL %s shares @ %.2f | token=%s | result=%s",
+                    order_type.upper(), sell_size, price, token_id[:12], signed,
                 )
                 if isinstance(signed, dict):
+                    # Normalise to _effective_price + _order_size from CLOB taking/making amounts.
+                    # For SELL: takingAmount=USDC received, makingAmount=shares sold.
+                    try:
+                        taking = float(signed.get("takingAmount") or 0)
+                        making = float(signed.get("makingAmount") or 0)
+                        if making > 0 and taking > 0:
+                            signed["_effective_price"] = taking / making
+                            signed["_order_size"] = making
+                        else:
+                            signed["_effective_price"] = price
+                            signed["_order_size"] = sell_size
+                    except (ValueError, TypeError):
+                        signed["_effective_price"] = price
+                        signed["_order_size"] = sell_size
                     return signed
-                return {"success": True, "order_id": str(signed)}
+                return {"success": True, "order_id": str(signed),
+                        "_effective_price": price, "_order_size": sell_size}
             except Exception as e:
                 return {"success": False, "error": str(e), "_exception": e}
 

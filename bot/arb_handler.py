@@ -67,6 +67,7 @@ FORCE_SELL_SEC = 30
 
 # ── Auto-exit ──
 EXIT_THRESHOLD = 1.03
+EXIT_RETRY_COOLDOWN = 5.0   # seconds between retry attempts on partial-fill
 
 
 class HedgeState(Enum):
@@ -187,6 +188,22 @@ def _classify_error(err: object) -> str:
     return str(err)[:80]
 
 
+async def _verify_matched(exec_client, result: dict, side: str) -> tuple[Optional[dict], Optional[str]]:
+    """FAK should always come back as 'matched'. If 'live' (rare race) — try cancel and treat as failure."""
+    status = (result.get("status") or "").lower()
+    if status == "matched":
+        return result, None
+    oid = str(result.get("orderID") or result.get("order_id") or "")
+    if status == "live" and oid:
+        try:
+            await exec_client.cancel_order(oid)
+            logger.warning("FAK %s went live unexpectedly — cancelled order %s", side, oid[:12])
+        except Exception as e:
+            logger.error("FAK %s went live, cancel failed: %s", side, e)
+        return None, "FAK went live (cancelled, no fill)"
+    return None, _classify_error(f"unexpected status={status}")
+
+
 async def _safe_fak_buy(exec_client, *, token, price, shares, neg_risk, market_slug, market_id) -> tuple[Optional[dict], Optional[str]]:
     """Single FAK buy. Returns (result, None) on success, (None, reason) on failure."""
     try:
@@ -196,7 +213,7 @@ async def _safe_fak_buy(exec_client, *, token, price, shares, neg_risk, market_s
             order_type="FAK", use_exact_price=True,
         )
         if isinstance(result, dict) and result.get("success") is not False:
-            return result, None
+            return await _verify_matched(exec_client, result, "BUY")
         err = result.get("error", "?") if isinstance(result, dict) else result
         reason = _classify_error(err)
         logger.warning("FAK buy returned error: %s", err)
@@ -210,9 +227,9 @@ async def _safe_fak_buy(exec_client, *, token, price, shares, neg_risk, market_s
 async def _safe_fak_sell(exec_client, *, token, price, shares) -> tuple[Optional[dict], Optional[str]]:
     """Single FAK sell. Returns (result, None) on success, (None, reason) on failure."""
     try:
-        result = await exec_client.sell_shares(token, price, shares)
+        result = await exec_client.sell_shares(token, price, shares, order_type="FAK")
         if isinstance(result, dict) and result.get("success") is not False:
-            return result, None
+            return await _verify_matched(exec_client, result, "SELL")
         err = result.get("error", "?") if isinstance(result, dict) else result
         reason = _classify_error(err)
         logger.warning("FAK sell returned error: %s", err)
@@ -261,6 +278,7 @@ class HedgeMonitor:
         self.leg2_cost = 0.0
 
         self.in_flight = False
+        self._last_exit_attempt_ts = 0.0
 
     async def run(self):
         sub_msg = json.dumps({"type": "market", "assets_ids": [self.leg1_token, self.opp_token]})
@@ -429,13 +447,19 @@ class HedgeMonitor:
             b_up = self.bid[self.market["token_up"]]
             b_down = self.bid[self.market["token_down"]]
             if b_up > 0 and b_down > 0 and b_up + b_down >= EXIT_THRESHOLD:
-                self.in_flight = True
-                try:
-                    await self._auto_exit(b_up, b_down)
-                finally:
-                    self.in_flight = False
-                self.state = HedgeState.CLOSED
-                return True
+                # Throttle retries — bid_sum often crosses threshold many times in a row
+                now_ts = datetime.now(timezone.utc).timestamp()
+                if now_ts - self._last_exit_attempt_ts >= EXIT_RETRY_COOLDOWN:
+                    self._last_exit_attempt_ts = now_ts
+                    self.in_flight = True
+                    try:
+                        succeeded = await self._auto_exit(b_up, b_down)
+                    finally:
+                        self.in_flight = False
+                    if succeeded:
+                        self.state = HedgeState.CLOSED
+                        return True
+                    # else: partial fill, stay in LEG2_OPEN, retry on next opportunity
 
         return False
 
@@ -508,7 +532,8 @@ class HedgeMonitor:
             )
         mark_hedge_sold(self.hedge_id)
 
-    async def _auto_exit(self, b_up: float, b_down: float):
+    async def _auto_exit(self, b_up: float, b_down: float) -> bool:
+        """Return True if both legs sold and hedge is fully closed; False if partial/failed."""
         from bot.storage import mark_hedge_sold
         token_up = self.market["token_up"]
         token_down = self.market["token_down"]
@@ -520,40 +545,61 @@ class HedgeMonitor:
 
         res_up, reason_up = await _safe_fak_sell(self.exec_client, token=token_up, price=b_up, shares=sh_up)
         if not res_up:
-            logger.warning("MON #%d UP sell FAILED (%s) — skip DOWN, settlement", self.hedge_id, reason_up)
+            logger.warning("MON #%d UP sell FAILED (%s) — skip DOWN, will retry", self.hedge_id, reason_up)
             if self.tg_send_fn:
                 await self.tg_send_fn(self.chat_id,
-                    f"⚠️ <b>Exit #{self.hedge_id} partial fail</b>\nUP sell failed: {reason_up} — DOWN NOT sold")
-            return
+                    f"⚠️ <b>Exit #{self.hedge_id} retry</b>\nUP sell failed: {reason_up} — DOWN not attempted, will retry")
+            return False
 
         res_down, reason_down = await _safe_fak_sell(self.exec_client, token=token_down, price=b_down, shares=sh_down)
         if not res_down:
             logger.warning("MON #%d DOWN sell FAILED (%s) after UP sold", self.hedge_id, reason_down)
 
         actual = 0.0
-        for res in (res_up, res_down):
+        sold_up = sold_down = 0.0
+        for res, shares_target in ((res_up, sh_up), (res_down, sh_down)):
             if not res:
                 continue
             try:
-                avg = float(res.get("average_price") or res.get("price") or 0)
-                sz = float(res.get("size") or res.get("_order_size") or 0)
-                if avg > 0 and sz > 0:
-                    actual += avg * sz
+                ep = float(res.get("_effective_price") or 0)
+                sz = float(res.get("_order_size") or 0)
+                if ep > 0 and sz > 0:
+                    actual += ep * sz
+                    if res is res_up:
+                        sold_up = sz
+                    else:
+                        sold_down = sz
             except Exception:
                 pass
 
         total_cost = self.leg1_cost + self.leg2_cost
         profit = round(actual - total_cost, 2)
 
+        # Both sides actually sold (or close to it)?
+        both_ok = res_up is not None and res_down is not None
+        partial = " (partial)" if not both_ok else ""
+
         if self.tg_send_fn:
+            fail_lines = []
+            if not res_up:
+                fail_lines.append(f"⚠️ UP sell FAIL: {reason_up}")
+            if not res_down:
+                fail_lines.append(f"⚠️ DOWN sell FAIL: {reason_down}")
+            extra = ("\n" + "\n".join(fail_lines)) if fail_lines else ""
             await self.tg_send_fn(self.chat_id,
-                f"💰 <b>Early exit #{self.hedge_id}</b>\n"
+                f"💰 <b>Early exit #{self.hedge_id}</b>{partial}\n"
                 f"bid_sum={bid_sum:.3f} ({b_up:.3f}+{b_down:.3f})\n"
-                f"Received: ~${actual:.2f} | Cost: ${total_cost:.2f}\n"
-                f"<b>Profit: ${profit:+.2f}</b>"
+                f"Sold: UP {sold_up:.1f}sh, DOWN {sold_down:.1f}sh\n"
+                f"Received: ${actual:.2f} | Cost: ${total_cost:.2f}\n"
+                f"<b>PnL: ${profit:+.2f}</b>{extra}"
             )
 
-        mark_hedge_sold(self.hedge_id)
+        # Only mark sold if both sides actually filled
+        if both_ok:
+            mark_hedge_sold(self.hedge_id)
+            return True
+        logger.warning("MON #%d EXIT: not both sides sold — leaving hedge open in DB", self.hedge_id)
+        return False
 
     async def _auto_sell_leg1(self, leg1_bid: float, secs_left: float):
         from bot.storage import mark_hedge_sold
